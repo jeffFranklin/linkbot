@@ -17,14 +17,13 @@ Run linkbot
 
         $ python linkbot.py
 """
-
 from slacker import Slacker
 from websocket import create_connection
 from random import choice
 import simplejson as json
 import re
 import linkconfig
-from linkbot import saml
+from linkbot import clients
 
 
 class LinkBotSeenException(Exception): pass
@@ -101,11 +100,15 @@ class JiraLinkBot(LinkBot):
     """Subclass LinkBot to customize response for JIRA links
 
     """
+    def __init__(self, conf):
+        super(JiraLinkBot, self).__init__(conf)
+        self.jira = clients.UwSamlJira(host=conf.get('HOST'),
+                                       auth=conf.get('AUTH'))
+
     def message(self, link_label):
         msg = super(JiraLinkBot, self).message(link_label)
         try:
-            jira = saml.UwSamlJira()
-            issue = jira.issue(link_label)
+            issue = self.jira.issue(link_label)
             summary = issue.fields.summary
             get_name = lambda person: person and person.displayName or 'None'
             reporter = '*Reporter* ' + get_name(issue.fields.reporter)
@@ -119,25 +122,49 @@ class JiraLinkBot(LinkBot):
         return msg
 
 
+class ServiceNowBot(LinkBot):
+    def __init__(self, conf):
+        super(ServiceNowBot, self).__init__(conf)
+        self.client = clients.ServiceNowClient(
+            host=conf.get('HOST'), auth=conf.get('AUTH'))
+
+    def message(self, link_label):
+        record = self.client.get(link_label)
+        link = self._strlink(link_label)
+        lines = [self._quip(link)]
+        for key, value in record.items(pretty_names=True):
+            if key == 'Subject':
+                lines.append(value or 'No subject')
+            elif key == 'Parent' and value:
+                link = self._strlink(value)
+                lines.append('*{key}* {link}'.format(key=key, link=link))
+            elif value and key != 'Number':
+                lines.append('*{key}* {value}'.format(key=key, value=value))
+        return '\n> '.join(lines)
+
+    def _strlink(self, link_label):
+        link = self.client.link(link_label)
+        return '<{link}|{label}>'.format(link=link, label=link_label)
+
+
 def linkbot():
     """Establish Slack connection and filter messages
     
     """
+    slack = Slacker(getattr(linkconfig, 'API_TOKEN'))
+    robo_id = slack.auth.test().body.get('user_id')
+    response = slack.rtm.start()
+    websocket = create_connection(response.body['url'])
+
+    link_bots = []
+    for bot_conf in getattr(linkconfig, 'LINKBOTS', []):
+        bot_class = globals()[bot_conf.get('LINK_CLASS', 'LinkBot')]
+        link_bots.append(bot_class(bot_conf))
+
+    if not len(link_bots):
+        raise Exception('No linkbots defined')
+
     try:
-        slack = Slacker(getattr(linkconfig, 'API_TOKEN'))
-        robo_id = slack.auth.test().body.get('user_id')
-        saml.CREDENTIALS = getattr(linkconfig, 'UW_SAML_CREDENTIALS', ())
-        response = slack.rtm.start()
-        websocket = create_connection(response.body['url'])
-
-        link_bots = []
-        for bot_conf in getattr(linkconfig, 'LINKBOTS', []):
-            bot_class = globals()[bot_conf.get('LINK_CLASS', 'LinkBot')]
-            link_bots.append(bot_class(bot_conf))
-
-        if not len(link_bots):
-            raise Exception('No linkbots defined')
-
         while True:
             try:
                 rcv = websocket.recv()
@@ -161,12 +188,8 @@ def linkbot():
                         bot.reset()
             except KeyError:
                 pass
-
-    except Exception as ex:
-        print('EXCEPTION: %s' % ex)
-        pass
-
-    websocket.close()
+    finally:
+        websocket.close()
 
 
 if __name__ == '__main__':
