@@ -24,6 +24,10 @@ import simplejson as json
 import re
 import linkconfig
 from linkbot import clients
+from flask import Flask
+import threading
+from functools import partial
+app = Flask(__name__)
 
 
 class LinkBotSeenException(Exception): pass
@@ -147,14 +151,8 @@ class ServiceNowBot(LinkBot):
         return '<{link}|{label}>'.format(link=link, label=link_label)
 
 
-def linkbot():
-    """Establish Slack connection and filter messages
-    
-    """
-    slack = Slacker(getattr(linkconfig, 'API_TOKEN'))
+def get_message_processor(slack):
     robo_id = slack.auth.test().body.get('user_id')
-    response = slack.rtm.start()
-    websocket = create_connection(response.body['url'])
 
     link_bots = []
     for bot_conf in getattr(linkconfig, 'LINKBOTS', []):
@@ -164,32 +162,78 @@ def linkbot():
     if not len(link_bots):
         raise Exception('No linkbots defined')
 
+    def process_slack_message(json_string):
+        j = json.loads(json_string)
+
+        if j['type'] == 'message':
+            if j.get('bot_id'):  # ignore all bots
+                return
+        
+            for bot in link_bots:
+                for match in bot.match(j['text']):
+                    print(j['text']+ " match!")
+                    try:
+                        slack.chat.post_message(
+                            j['channel'],
+                            bot.message(match[1]),
+                            as_user=robo_id,
+                            parse='none')
+                    except LinkBotSeenException:
+                        pass
+                bot.reset()
+    return process_slack_message
+
+
+def linkbot():
+    """Establish Slack connection and filter messages
+    
+    """
+    slack = Slacker(getattr(linkconfig, 'API_TOKEN'))
+    process_slack_message = get_message_processor(slack)
+    response = slack.rtm.start()
+    websocket = create_connection(response.body['url'])
     try:
         while True:
             try:
                 rcv = websocket.recv()
-                j = json.loads(rcv)
-
-                if j['type'] == 'message':
-                    if j.get('bot_id'):  # ignore all bots
-                        continue
-
-                    for bot in link_bots:
-                        for match in bot.match(j['text']):
-                            print(j['text']+ " match!")
-                            try:
-                                slack.chat.post_message(
-                                    j['channel'],
-                                    bot.message(match[1]),
-                                    as_user=robo_id,
-                                    parse='none')
-                            except LinkBotSeenException:
-                                pass
-                        bot.reset()
+                process_slack_message(rcv)
             except KeyError:
                 pass
     finally:
         websocket.close()
+
+from queue import Queue
+
+q = Queue()
+NETID_GEN = (f'NETID-{i}' for i in range(900, 1100))
+
+@app.route('/', methods=['POST'])
+def index():
+    message = request.get_json()
+    message = json.dumps({'type': 'message', 'text': next(NETID_GEN), 'channel': '#jpf-throwaway'})
+    q.put(message)
+    return message
+
+
+def worker(process_message):
+    while True:
+        message = q.get()
+        app.logger.error(f'we got {message}')
+        if not message:
+            break
+        process_message(message)
+        q.task_done()
+
+
+threads = []
+for _ in range(2):
+    t = threading.Thread(target=partial(worker, get_message_processor(Slacker(linkconfig.API_TOKEN))))
+    t.start()
+    threads.append(t)
+
+
+# this allows us to load this script through mod_wsgi
+application = app
 
 
 if __name__ == '__main__':
